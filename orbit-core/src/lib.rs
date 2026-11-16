@@ -4,6 +4,7 @@
 //! the Orbit inference engine:
 //!
 //! - [`config`]        — model & runtime configuration
+//! - [`buffer`]        — abstract ZoneBuffer trait + placeholder
 //! - [`gz_cache`]      — Grouped-Zonal Cache (route / zone / reuse / zip)
 //! - [`looped_moe`]    — shared experts + per-loop routers + residual scaling
 //! - [`iter_adln`]     — IterAdaLN (iteration-aware adaptive LayerNorm)
@@ -12,12 +13,14 @@
 #![deny(missing_docs)]
 #![allow(dead_code)] // scaffolding while we build out real implementations
 
+pub mod buffer;
 pub mod config;
 pub mod gz_cache;
 pub mod iter_adln;
 pub mod looped_moe;
 pub mod router;
 
+pub use buffer::{DeviceKind, PlaceholderBuffer, ZoneBuffer};
 pub use config::OrbitConfig;
 pub use gz_cache::{
     GzCache, GzCacheConfig, MemoryStats, Zone, ZoneKey, ZoneState,
