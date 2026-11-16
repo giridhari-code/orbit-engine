@@ -1,0 +1,20 @@
+[package]
+name = "orbit-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Core primitives for Orbit: GZ Cache, ZoneBuffer, Looped MoE layers, IterAdaLN, routers"
+
+[dependencies]
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+default = ["cpu"]
+cpu = []
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
