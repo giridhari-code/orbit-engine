@@ -1,0 +1,20 @@
+[package]
+name = "orbit-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Core tensors, Looped MoE layers, IterAdaLN, and GZ Cache for Orbit Engine"
+
+[dependencies]
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+default = ["cpu"]
+cpu = []
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
