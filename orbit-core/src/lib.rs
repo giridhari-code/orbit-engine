@@ -10,7 +10,7 @@
 //! - [`router`]        — Top-K routing utilities
 
 #![deny(missing_docs)]
-#![allow(dead_code)] // scaffolding
+#![allow(dead_code)] // scaffolding while we build out real implementations
 
 pub mod config;
 pub mod gz_cache;
@@ -19,7 +19,9 @@ pub mod looped_moe;
 pub mod router;
 
 pub use config::OrbitConfig;
-pub use gz_cache::{GzCache, Zone, ZoneKey};
+pub use gz_cache::{
+    GzCache, GzCacheConfig, MemoryStats, Zone, ZoneKey, ZoneState,
+};
 pub use looped_moe::LoopedMoELayer;
 
 /// Crate-level error type.
