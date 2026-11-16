@@ -10,13 +10,13 @@
 //! 4. Zip the Inactive     — compress + offload to CPU
 //!
 //! This module focuses on the *memory management and lifecycle* layer.
-//! Actual tensor storage (candle / custom) will be plugged in later.
-//! The design is intentionally production-shaped: explicit states,
-//! memory accounting, and async-ready offload/prefetch interfaces.
+//! Actual tensor storage is abstracted behind the [`ZoneBuffer`] trait.
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
+use crate::buffer::{DeviceKind, PlaceholderBuffer, ZoneBuffer};
 use crate::{OrbitError, Result};
 
 // ---------------------------------------------------------------------------
@@ -78,26 +78,15 @@ impl fmt::Display for ZoneState {
 
 /// A single zone holding KV data for tokens that routed to a particular
 /// (loop, expert) pair.
-///
-/// Tensor storage is intentionally abstract for now. We track metadata and
-/// lifecycle so that the rest of the engine can reason about memory without
-/// depending on a specific backend.
 #[derive(Debug)]
 pub struct Zone {
     pub key: ZoneKey,
     pub state: ZoneState,
 
-    /// Current logical sequence length stored in this zone.
-    pub seq_len: usize,
-    /// Allocated capacity (in tokens). May be larger than seq_len.
-    pub capacity: usize,
+    /// The actual data. Abstracted so we can swap backends later.
+    pub buffer: Arc<dyn ZoneBuffer>,
 
-    /// Approximate bytes currently occupied by this zone
-    /// (on whichever device it currently resides).
-    pub bytes_used: u64,
-
-    /// Last time this zone was used (for future eviction policies).
-    /// Represented as a simple monotonic counter for now.
+    /// Last time this zone was used (monotonic counter for LRU).
     pub last_used: u64,
 }
 
@@ -105,10 +94,8 @@ impl Zone {
     fn new(key: ZoneKey) -> Self {
         Self {
             key,
-            state: ZoneState::CpuResident, // start on CPU; promote on demand
-            seq_len: 0,
-            capacity: 0,
-            bytes_used: 0,
+            state: ZoneState::CpuResident,
+            buffer: Arc::new(PlaceholderBuffer::empty(DeviceKind::Cpu)),
             last_used: 0,
         }
     }
@@ -121,6 +108,21 @@ impl Zone {
     #[inline]
     pub fn is_ready_for_compute(&self) -> bool {
         matches!(self.state, ZoneState::GpuResident)
+    }
+
+    #[inline]
+    pub fn seq_len(&self) -> usize {
+        self.buffer.seq_len()
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.buffer.capacity()
+    }
+
+    #[inline]
+    pub fn bytes_used(&self) -> u64 {
+        self.buffer.bytes_used()
     }
 }
 
@@ -149,7 +151,6 @@ pub struct MemoryStats {
 #[derive(Debug, Clone)]
 pub struct GzCacheConfig {
     /// Soft limit on how many zones may be GpuResident at once.
-    /// When exceeded, the cache will try to offload least-recently-used zones.
     pub max_gpu_zones: usize,
 
     /// Soft limit on total GPU bytes (0 = unlimited).
@@ -163,15 +164,13 @@ impl Default for GzCacheConfig {
     fn default() -> Self {
         Self {
             max_gpu_zones: 32,
-            max_gpu_bytes: 0, // unlimited by default
-            compress_on_offload: false, // start simple
+            max_gpu_bytes: 0,
+            compress_on_offload: false,
         }
     }
 }
 
 /// The Grouped-Zonal Cache manager.
-///
-/// This is the central object that the runtime and scheduler will talk to.
 #[derive(Debug)]
 pub struct GzCache {
     config: GzCacheConfig,
@@ -228,12 +227,10 @@ impl GzCache {
 
     /// Ensure the zone is ready for compute on GPU.
     ///
-    /// This is the main entry point the forward pass will call.
     /// Returns `true` if the zone was already GpuResident.
     pub fn pin_for_compute(&mut self, key: ZoneKey) -> Result<bool> {
         self.clock = self.clock.wrapping_add(1);
 
-        // First ensure the zone exists.
         let already_ready = {
             let zone = self.get_or_create(key);
             zone.last_used = self.clock;
@@ -244,34 +241,25 @@ impl GzCache {
             return Ok(true);
         }
 
-        // May need to free space first.
         self.ensure_gpu_capacity_for(key)?;
 
-        // Perform the state transition.
         let zone = self.get_or_create(key);
         match zone.state {
             ZoneState::GpuResident => Ok(true),
             ZoneState::CpuResident | ZoneState::Compressed => {
-                // In a real system this would trigger a DMA / copy / decompress.
-                // For now we just flip the state and update accounting later.
+                // Real implementation would move / decompress the buffer here.
                 zone.state = ZoneState::GpuResident;
                 Ok(false)
             }
-            ZoneState::InTransit { to_gpu: true } => {
-                // Already moving toward GPU; treat as success for now.
-                // A real implementation would wait or return a future.
-                Ok(false)
-            }
-            ZoneState::InTransit { to_gpu: false } => {
-                Err(OrbitError::Cache(format!(
-                    "zone {} is currently being offloaded; cannot pin", 
-                    key
-                )))
-            }
+            ZoneState::InTransit { to_gpu: true } => Ok(false),
+            ZoneState::InTransit { to_gpu: false } => Err(OrbitError::Cache(format!(
+                "zone {} is currently being offloaded; cannot pin",
+                key
+            ))),
         }
     }
 
-    /// Mark a zone as no longer needed on GPU (eligible for offload).
+    /// Mark a zone as no longer needed on GPU.
     pub fn release(&mut self, key: ZoneKey) -> Result<()> {
         if let Some(zone) = self.zones.get_mut(&key) {
             if matches!(zone.state, ZoneState::GpuResident) {
@@ -282,9 +270,6 @@ impl GzCache {
     }
 
     /// Explicitly request offload of a zone to CPU.
-    ///
-    /// This is the synchronous version. An async version will be added
-    /// once we have a real runtime executor.
     pub fn offload(&mut self, key: ZoneKey) -> Result<()> {
         let compress = self.config.compress_on_offload;
         if let Some(zone) = self.zones.get_mut(&key) {
@@ -299,32 +284,28 @@ impl GzCache {
                 }
                 ZoneState::Compressed => Ok(()),
                 ZoneState::InTransit { .. } => Err(OrbitError::Cache(format!(
-                    "zone {} is in transit; cannot offload", 
+                    "zone {} is in transit; cannot offload",
                     key
                 ))),
             }
         } else {
-            Ok(()) // nothing to do
+            Ok(())
         }
     }
 
-    /// Hint that a zone will be needed soon (prefetch).
-    ///
-    /// Currently a no-op beyond ensuring the zone exists.
-    /// Later this will trigger async movement toward GPU.
+    /// Hint that a zone will be needed soon.
     pub fn prefetch(&mut self, key: ZoneKey) -> Result<()> {
         let _ = self.get_or_create(key);
-        // TODO: enqueue async transfer if not already GpuResident
         Ok(())
     }
 
-    /// Drop a zone completely (free all resources).
+    /// Drop a zone completely.
     pub fn drop_zone(&mut self, key: ZoneKey) -> Result<()> {
         self.zones.remove(&key);
         Ok(())
     }
 
-    /// Clear everything (end of request / sequence).
+    /// Clear everything.
     pub fn clear(&mut self) {
         self.zones.clear();
         self.clock = 0;
@@ -345,7 +326,6 @@ impl GzCache {
             return Ok(());
         }
 
-        // Simple LRU: find the least-recently-used GpuResident zone and offload it.
         let victim = self
             .zones
             .iter()
@@ -371,22 +351,22 @@ impl GzCache {
         };
 
         for zone in self.zones.values() {
+            let bytes = zone.bytes_used();
             match zone.state {
                 ZoneState::GpuResident => {
-                    stats.gpu_bytes += zone.bytes_used;
+                    stats.gpu_bytes += bytes;
                     stats.num_gpu_resident += 1;
                 }
                 ZoneState::CpuResident => {
-                    stats.cpu_bytes += zone.bytes_used;
+                    stats.cpu_bytes += bytes;
                     stats.num_cpu_resident += 1;
                 }
                 ZoneState::Compressed => {
-                    stats.compressed_bytes += zone.bytes_used;
+                    stats.compressed_bytes += bytes;
                     stats.num_compressed += 1;
                 }
                 ZoneState::InTransit { .. } => {
                     stats.num_in_transit += 1;
-                    // bytes are counted on the source side for now
                 }
             }
         }
@@ -418,11 +398,11 @@ mod tests {
 
         assert!(!cache.contains(key));
         let was_ready = cache.pin_for_compute(key).unwrap();
-        assert!(!was_ready); // first time
+        assert!(!was_ready);
         assert!(cache.get(key).unwrap().is_gpu_resident());
 
         let was_ready = cache.pin_for_compute(key).unwrap();
-        assert!(was_ready); // second time
+        assert!(was_ready);
 
         cache.release(key).unwrap();
         assert!(!cache.get(key).unwrap().is_gpu_resident());
@@ -444,7 +424,6 @@ mod tests {
         cache.pin_for_compute(k1).unwrap();
         assert_eq!(cache.memory_stats().num_gpu_resident, 2);
 
-        // Pinning a third should force one offload
         cache.pin_for_compute(k2).unwrap();
         let stats = cache.memory_stats();
         assert_eq!(stats.num_gpu_resident, 2);
@@ -452,18 +431,22 @@ mod tests {
     }
 
     #[test]
-    fn memory_stats_smoke() {
+    fn buffer_integration() {
         let mut cache = GzCache::with_defaults();
         let key = ZoneKey::new(1, 5);
         cache.pin_for_compute(key).unwrap();
 
-        // Manually set some bytes for testing
-        if let Some(z) = cache.get_mut(key) {
-            z.bytes_used = 1024 * 1024;
+        // Replace the placeholder with one that reports real size
+        if let Some(zone) = cache.get_mut(key) {
+            zone.buffer = Arc::new(PlaceholderBuffer::with_size(
+                128,
+                256, // bytes per token (fake)
+                DeviceKind::Gpu { device_id: 0 },
+            ));
         }
 
         let stats = cache.memory_stats();
         assert_eq!(stats.num_gpu_resident, 1);
-        assert_eq!(stats.gpu_bytes, 1024 * 1024);
+        assert_eq!(stats.gpu_bytes, 128 * 256);
     }
 }
