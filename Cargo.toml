@@ -1,8 +1,8 @@
 [workspace]
 members = [
-    "orbit-core",
-    "orbit-runtime",
-    "orbit-server",
+    "crates/orbit-core",
+    "crates/orbit-runtime",
+    "crates/orbit-server",
 ]
 resolver = "2"
 
