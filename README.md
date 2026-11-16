@@ -2,43 +2,29 @@
 
 **Tagline:** *Loop the Future. Compute only what matters. Scale beyond boundaries.*
 
-**Status:** Pre-Alpha / Architectural Design  
-**Language:** Rust (Powered by Hugging Face `candle`) + C++ kernels  
-**Target Architecture:** Looped Mixture-of-Experts (Looped MoE)
+**Status:** Pre-Alpha  
+**Language:** Rust + native kernels  
+**Target:** Looped Mixture-of-Experts (Looped MoE) Inference Engine
 
 ---
 
-## Abstract
+## What is Orbit?
 
-The rapid scaling of Large Language Models (LLMs) has led to unsustainable inference costs. **Orbit** is a next-generation, memory-safe LLM inference engine built in Rust, designed specifically for **Looped Mixture-of-Experts (Looped MoE)** architectures.
+Orbit is a **memory-safe LLM inference engine** specialized for **Looped MoE** architectures.
 
-Unlike traditional engines that treat LLMs as static dense models, Orbit embraces the orthogonal scaling axes of **Recurrence** (looping shared layers for effective depth) and **Sparsity** (activating only relevant experts for parameter capacity). By combining Rust's fearless concurrency with intelligent CPU-GPU orchestration and C++ performance kernels, Orbit delivers enterprise-grade throughput, low latency, and zero-copy memory management on any hardware—from edge devices to multi-GPU clusters.
-
----
-
-## The Orbit Philosophy (10 Pillars)
-
-1. **Recurrence over Width:** Loop the parameters, don't just stack them. Maximize effective depth with minimal VRAM.
-2. **Sparsity by Default:** Compute only what matters. Per-loop routers ensure zero FLOPs on irrelevant weights.
-3. **Memory is Sacred:** Fearless concurrency and zero garbage collection overhead. Paged KV-cache + **GZ Cache** ensures no fragmentation.
-4. **Micro-kernel Architecture:** Separation of concerns between Core (math), Runtime (memory/scheduling), and Server (API).
-5. **CPU-GPU Synergy:** *"Compute on GPU, Park on CPU."* Asynchronous offloading of inactive experts to CPU RAM.
-6. **Distributed Orbit:** Expert Parallelism by default.
-7. **Intelligent Scheduling:** Continuous Batching and Prefill-Decode Disaggregation.
-8. **Zero-Redundancy Caching:** RadixAttention and Prefix Caching.
-9. **Lossless Acceleration:** Speculative Decoding.
-10. **Enterprise-Ready & Edge-Native:** Multi-tenancy, RBAC/SSO, offline edge profile.
+It treats **Recurrence** (looping shared layers) and **Sparsity** (activating only relevant experts) as first-class scaling axes, and provides a production-oriented memory model (**GZ Cache**) + scheduling layer for CPU-GPU offloading and multi-GPU execution.
 
 ---
 
-## GZ Cache (Grouped-Zonal Cache)
+## Where is the LLM Inference Engine?
 
-Traditional KV-Cache explodes under Looped MoE (R loops × experts). **GZ Cache** replaces it:
+| Layer | Crate | Responsibility |
+|-------|-------|----------------|
+| **Primitives** | `crates/orbit-core` | GZ Cache, ZoneBuffer, LoopedMoE, routers, IterAdaLN |
+| **Inference Engine** | `crates/orbit-runtime` | **Main engine** — Scheduler, request lifecycle, continuous batching, cache orchestration |
+| **Serving** | `crates/orbit-server` | HTTP/gRPC, auth, multi-tenancy |
 
-- **Route over Store** — memory allocated only for active expert paths
-- **Zone the Memory** — zones keyed by `(Loop_Index, Expert_ID)`
-- **Reuse over Recompute** — shared base tensors modulated by IterAdaLN
-- **Zip the Inactive** — compress + offload inactive zones to CPU
+**Short answer:** The actual inference engine lives in **`orbit-runtime`** (built on top of `orbit-core`).
 
 ---
 
@@ -46,14 +32,28 @@ Traditional KV-Cache explodes under Looped MoE (R loops × experts). **GZ Cache*
 
 ```
 orbit-engine/
-├── Cargo.toml              # Workspace root
-├── orbit-core/             # Core tensors, Looped MoE layers, GZ Cache
-├── orbit-runtime/          # Scheduler, continuous batching, KV/GZ management
-├── orbit-server/           # HTTP/gRPC serving, auth, multi-tenancy
-├── cpp/                    # High-performance C++ kernels (optional CUDA/CPU)
-├── docs/                   # Research survey + design docs
-└── examples/
+├── Cargo.toml
+├── LICENSE
+├── README.md
+├── crates/
+│   ├── orbit-core/          # memory + model primitives
+│   ├── orbit-runtime/       # ★ main LLM inference engine
+│   └── orbit-server/        # serving layer
+├── native/                 # C++/CUDA kernels (FFI)
+├── docs/
+└── examples/               # (coming)
 ```
+
+---
+
+## GZ Cache (Grouped-Zonal Cache)
+
+Traditional KV-Cache explodes under Looped MoE. GZ Cache replaces it:
+
+- **Route over Store** — allocate only for active expert paths
+- **Zone the Memory** — zones keyed by `(loop_idx, expert_id)`
+- **Reuse over Recompute** — shared base + IterAdaLN modulation
+- **Zip the Inactive** — compress + offload to CPU
 
 ---
 
@@ -61,26 +61,14 @@ orbit-engine/
 
 ```bash
 cargo build --release
-cargo run -p orbit-server -- --model path/to/looped-moe
+cargo run -p orbit-server
 ```
-
----
-
-## Research Background
-
-See `docs/` for the full Looped MoE survey (LoopMoE, LOOM, Loopie, scaling laws).
-
-**Key ideas implemented:**
-- IterAdaLN (iteration-aware adaptive layer norm)
-- Per-loop routers
-- Residual scaling + input re-injection
-- Load balancing (aux loss + z-loss)
 
 ---
 
 ## License
 
-Apache-2.0 (planned)
+Apache-2.0
 
 ---
 
