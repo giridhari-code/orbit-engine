@@ -2,15 +2,13 @@
 //!
 //! Parallel Residual LoopMoE Token Factory.
 //!
-//! Model semantics:
+//! Model semantics (only mode):
 //!   h0 = Embed(x)
 //!   for k in 1..R (parallel):
 //!       r_k = λ_k * Loop_k(h0)
 //!   final = h0 + sum(r_k)
 //!
-//! The factory never runs loops sequentially for one token.
-//! It builds work items, buckets by (loop, expert), pins zones,
-//! and conceptually launches all buckets in parallel.
+//! Sequential recurrence is not supported.
 
 #![deny(missing_docs)]
 
@@ -33,8 +31,7 @@ pub struct RequestId(pub u64);
 
 /// Lightweight per-request state.
 ///
-/// Note: under Parallel Residual we do **not** track current_loop.
-/// All loops run together each step.
+/// All parallel residual loops run together each step — no current_loop.
 #[derive(Debug)]
 pub struct Sequence {
     pub id: RequestId,
@@ -61,10 +58,6 @@ impl Sequence {
 }
 
 /// The Parallel Residual Token Factory.
-///
-/// Owns active sequences + GZ Cache. Each `step()` builds a full
-/// parallel plan across all loops and experts, pins zones, and
-/// (later) launches compute.
 #[derive(Debug)]
 pub struct TokenFactory {
     pub model_config: OrbitConfig,
@@ -75,10 +68,6 @@ pub struct TokenFactory {
 
 impl TokenFactory {
     pub fn new(model_config: OrbitConfig, cache_config: GzCacheConfig) -> Self {
-        assert!(
-            model_config.is_parallel_residual(),
-            "TokenFactory currently requires ParallelResidual semantics"
-        );
         Self {
             model_config,
             cache: Arc::new(Mutex::new(GzCache::new(cache_config))),
@@ -107,18 +96,15 @@ impl TokenFactory {
     /// Build + pin a parallel step for all active requests.
     ///
     /// `decisions[request_index][loop_idx] = Vec<(expert_id, gate_weight)>`
-    ///
-    /// Returns the plan so the caller (or later the executor) can run buckets.
     pub fn prepare_parallel_step(
         &mut self,
-        // parallel to active sequences in stable order
         decisions: &[Vec<Vec<(u32, f32)>>],
     ) -> Result<ParallelStepPlan, String> {
         let active: Vec<(RequestId, u32)> = self
             .sequences
             .values()
             .filter(|s| !s.is_finished())
-            .map(|s| (s.id, s.generated_len as u32)) // token_pos ≈ current len for decode
+            .map(|s| (s.id, s.generated_len as u32))
             .collect();
 
         if active.is_empty() {
@@ -126,9 +112,8 @@ impl TokenFactory {
         }
 
         let num_loops = self.model_config.num_loops as u32;
-        let mut plan = build_parallel_plan(&active, num_loops, decisions);
+        let plan = build_parallel_plan(&active, num_loops, decisions);
 
-        // Pin every required zone
         let mut cache = self.cache.lock().map_err(|e| e.to_string())?;
         for zone in &plan.required_zones {
             cache
@@ -136,7 +121,6 @@ impl TokenFactory {
                 .map_err(|e| e.to_string())?;
         }
 
-        // Record touched zones on sequences
         for item in plan.buckets.values().flat_map(|b| b.items.iter()) {
             if let Some(seq) = self.sequences.get_mut(&item.request_id) {
                 let key = ZoneKey::new(item.loop_idx, item.expert_id);
@@ -193,9 +177,6 @@ impl TokenFactory {
     }
 }
 
-/// Backward-compatible alias while we migrate call sites.
-pub type Scheduler = TokenFactory;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,17 +184,11 @@ mod tests {
 
     #[test]
     fn parallel_step_pins_all_loop_zones() {
-        let mut factory = TokenFactory::with_defaults(OrbitConfig::default());
-        let id1 = factory.add_request(8);
-        let id2 = factory.add_request(8);
-
-        // 2 loops, top-2 experts (matches default num_loops=4 would be larger;
-        // we only supply 2 loops of decisions for a smaller smoke test)
         let mut cfg = OrbitConfig::default();
         cfg.num_loops = 2;
         let mut factory = TokenFactory::with_defaults(cfg);
-        let id1 = factory.add_request(8);
-        let id2 = factory.add_request(8);
+        let _id1 = factory.add_request(8);
+        let _id2 = factory.add_request(8);
 
         let decisions = vec![
             vec![vec![(0, 0.6), (1, 0.4)], vec![(1, 0.7), (2, 0.3)]],
@@ -223,7 +198,5 @@ mod tests {
         let plan = factory.prepare_parallel_step(&decisions).unwrap();
         assert_eq!(plan.num_buckets(), 6);
         assert!(factory.memory_stats().unwrap().num_gpu_resident >= 6);
-
-        let _ = (id1, id2);
     }
 }
