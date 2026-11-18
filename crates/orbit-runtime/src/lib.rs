@@ -1,14 +1,24 @@
 //! Orbit Runtime — **the main LLM Inference Engine**
 //!
-//! This crate owns:
-//! - Request / Sequence lifecycle
-//! - Continuous batching (future)
-//! - GZ Cache orchestration (pin / release / prefetch)
-//! - Scheduling decisions
+//! Parallel Residual LoopMoE Token Factory.
 //!
-//! It sits between `orbit-server` and `orbit-core`.
+//! Model semantics:
+//!   h0 = Embed(x)
+//!   for k in 1..R (parallel):
+//!       r_k = λ_k * Loop_k(h0)
+//!   final = h0 + sum(r_k)
+//!
+//! The factory never runs loops sequentially for one token.
+//! It builds work items, buckets by (loop, expert), pins zones,
+//! and conceptually launches all buckets in parallel.
 
 #![deny(missing_docs)]
+
+mod parallel;
+
+pub use parallel::{
+    build_parallel_plan, ExpertBucket, ParallelStepPlan, WorkItem,
+};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -21,19 +31,16 @@ use orbit_core::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RequestId(pub u64);
 
-/// State of a single sequence / request.
+/// Lightweight per-request state.
+///
+/// Note: under Parallel Residual we do **not** track current_loop.
+/// All loops run together each step.
 #[derive(Debug)]
 pub struct Sequence {
     pub id: RequestId,
-    /// How many tokens have been generated so far.
     pub generated_len: usize,
-    /// Maximum tokens this request is allowed to generate.
     pub max_new_tokens: usize,
-    /// Current loop index we are executing (0..R).
-    pub current_loop: u32,
-    /// Zones this sequence has touched (for cleanup).
     pub touched_zones: Vec<ZoneKey>,
-    /// Whether the sequence is finished.
     pub finished: bool,
 }
 
@@ -43,7 +50,6 @@ impl Sequence {
             id,
             generated_len: 0,
             max_new_tokens,
-            current_loop: 0,
             touched_zones: Vec::new(),
             finished: false,
         }
@@ -54,20 +60,25 @@ impl Sequence {
     }
 }
 
-/// The heart of the Orbit Inference Engine.
+/// The Parallel Residual Token Factory.
 ///
-/// Owns the GZ Cache and all active sequences. Decides when zones
-/// should be pinned, released, or prefetched.
+/// Owns active sequences + GZ Cache. Each `step()` builds a full
+/// parallel plan across all loops and experts, pins zones, and
+/// (later) launches compute.
 #[derive(Debug)]
-pub struct Scheduler {
+pub struct TokenFactory {
     pub model_config: OrbitConfig,
     cache: Arc<Mutex<GzCache>>,
     sequences: HashMap<RequestId, Sequence>,
     next_request_id: u64,
 }
 
-impl Scheduler {
+impl TokenFactory {
     pub fn new(model_config: OrbitConfig, cache_config: GzCacheConfig) -> Self {
+        assert!(
+            model_config.is_parallel_residual(),
+            "TokenFactory currently requires ParallelResidual semantics"
+        );
         Self {
             model_config,
             cache: Arc::new(Mutex::new(GzCache::new(cache_config))),
@@ -89,60 +100,76 @@ impl Scheduler {
         id
     }
 
-    /// Number of currently active (not finished) sequences.
     pub fn active_count(&self) -> usize {
         self.sequences.values().filter(|s| !s.is_finished()).count()
     }
 
-    /// Prepare zones for a given loop of a request.
-    pub fn prepare_loop(
+    /// Build + pin a parallel step for all active requests.
+    ///
+    /// `decisions[request_index][loop_idx] = Vec<(expert_id, gate_weight)>`
+    ///
+    /// Returns the plan so the caller (or later the executor) can run buckets.
+    pub fn prepare_parallel_step(
         &mut self,
-        request_id: RequestId,
-        loop_idx: u32,
-        expert_ids: &[u32],
-    ) -> Result<(), String> {
-        let seq = self
+        // parallel to active sequences in stable order
+        decisions: &[Vec<Vec<(u32, f32)>>],
+    ) -> Result<ParallelStepPlan, String> {
+        let active: Vec<(RequestId, u32)> = self
             .sequences
-            .get_mut(&request_id)
-            .ok_or_else(|| format!("unknown request {:?}", request_id))?;
+            .values()
+            .filter(|s| !s.is_finished())
+            .map(|s| (s.id, s.generated_len as u32)) // token_pos ≈ current len for decode
+            .collect();
 
-        if seq.is_finished() {
-            return Err("sequence already finished".into());
+        if active.is_empty() {
+            return Ok(ParallelStepPlan::new());
         }
 
-        seq.current_loop = loop_idx;
+        let num_loops = self.model_config.num_loops as u32;
+        let mut plan = build_parallel_plan(&active, num_loops, decisions);
 
+        // Pin every required zone
         let mut cache = self.cache.lock().map_err(|e| e.to_string())?;
-
-        for &expert_id in expert_ids {
-            let key = ZoneKey::new(loop_idx, expert_id);
+        for zone in &plan.required_zones {
             cache
-                .pin_for_compute(key)
+                .pin_for_compute(*zone)
                 .map_err(|e| e.to_string())?;
+        }
 
-            if !seq.touched_zones.contains(&key) {
-                seq.touched_zones.push(key);
+        // Record touched zones on sequences
+        for item in plan.buckets.values().flat_map(|b| b.items.iter()) {
+            if let Some(seq) = self.sequences.get_mut(&item.request_id) {
+                let key = ZoneKey::new(item.loop_idx, item.expert_id);
+                if !seq.touched_zones.contains(&key) {
+                    seq.touched_zones.push(key);
+                }
             }
         }
 
-        Ok(())
+        Ok(plan)
     }
 
-    /// Mark that one token has been generated for this request.
-    pub fn advance_token(&mut self, request_id: RequestId) -> Result<(), String> {
-        let seq = self
-            .sequences
-            .get_mut(&request_id)
-            .ok_or_else(|| format!("unknown request {:?}", request_id))?;
-
-        seq.generated_len += 1;
-        if seq.generated_len >= seq.max_new_tokens {
-            seq.finished = true;
+    /// After compute + sampling: advance token counts.
+    pub fn advance_tokens(&mut self, finished_ids: &[RequestId]) -> Result<(), String> {
+        for id in self.sequences.keys().copied().collect::<Vec<_>>() {
+            if let Some(seq) = self.sequences.get_mut(&id) {
+                if !seq.is_finished() {
+                    seq.generated_len += 1;
+                    if seq.generated_len >= seq.max_new_tokens {
+                        seq.finished = true;
+                    }
+                }
+            }
+        }
+        for &id in finished_ids {
+            if let Some(seq) = self.sequences.get_mut(&id) {
+                seq.finished = true;
+            }
         }
         Ok(())
     }
 
-    /// Release all zones touched by a finished request.
+    /// Release zones and drop a finished request.
     pub fn finish_request(&mut self, request_id: RequestId) -> Result<(), String> {
         let seq = self
             .sequences
@@ -156,17 +183,18 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Current memory statistics from the underlying cache.
     pub fn memory_stats(&self) -> Result<MemoryStats, String> {
         let cache = self.cache.lock().map_err(|e| e.to_string())?;
         Ok(cache.memory_stats())
     }
 
-    /// Access the shared cache (for advanced use / testing).
     pub fn cache(&self) -> Arc<Mutex<GzCache>> {
         Arc::clone(&self.cache)
     }
 }
+
+/// Backward-compatible alias while we migrate call sites.
+pub type Scheduler = TokenFactory;
 
 #[cfg(test)]
 mod tests {
@@ -174,20 +202,28 @@ mod tests {
     use orbit_core::OrbitConfig;
 
     #[test]
-    fn request_lifecycle() {
-        let mut sched = Scheduler::with_defaults(OrbitConfig::default());
-        let id = sched.add_request(10);
+    fn parallel_step_pins_all_loop_zones() {
+        let mut factory = TokenFactory::with_defaults(OrbitConfig::default());
+        let id1 = factory.add_request(8);
+        let id2 = factory.add_request(8);
 
-        assert_eq!(sched.active_count(), 1);
+        // 2 loops, top-2 experts (matches default num_loops=4 would be larger;
+        // we only supply 2 loops of decisions for a smaller smoke test)
+        let mut cfg = OrbitConfig::default();
+        cfg.num_loops = 2;
+        let mut factory = TokenFactory::with_defaults(cfg);
+        let id1 = factory.add_request(8);
+        let id2 = factory.add_request(8);
 
-        sched.prepare_loop(id, 0, &[1, 4]).unwrap();
+        let decisions = vec![
+            vec![vec![(0, 0.6), (1, 0.4)], vec![(1, 0.7), (2, 0.3)]],
+            vec![vec![(0, 0.5), (2, 0.5)], vec![(0, 0.9), (1, 0.1)]],
+        ];
 
-        let stats = sched.memory_stats().unwrap();
-        assert_eq!(stats.num_gpu_resident, 2);
+        let plan = factory.prepare_parallel_step(&decisions).unwrap();
+        assert_eq!(plan.num_buckets(), 6);
+        assert!(factory.memory_stats().unwrap().num_gpu_resident >= 6);
 
-        sched.advance_token(id).unwrap();
-        sched.finish_request(id).unwrap();
-
-        assert_eq!(sched.active_count(), 0);
+        let _ = (id1, id2);
     }
 }
