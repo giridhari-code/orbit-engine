@@ -1,16 +1,18 @@
 //! Orbit Core — Parallel Residual LoopMoE primitives + Grouped-Zonal Cache
 //!
-//! Model semantics (default):
+//! Model semantics (only mode):
 //!   h0 = Embed(x)
 //!   for k in 1..R (parallel):
 //!       r_k = λ_k * Loop_k(h0)
 //!   final = h0 + sum(r_k)
 //!
+//! Sequential recurrence is not supported.
+//!
 //! Modules:
-//! - [`config`]     — OrbitConfig + LoopSemantics
+//! - [`config`]     — OrbitConfig
 //! - [`buffer`]     — ZoneBuffer trait
 //! - [`gz_cache`]   — Grouped-Zonal Cache
-//! - [`looped_moe`] — parallel residual layer skeleton
+//! - [`looped_moe`] — parallel residual layer
 //! - [`iter_adln`]  — iteration-aware adaptive LN
 //! - [`router`]     — Top-K routing
 
@@ -25,7 +27,7 @@ pub mod looped_moe;
 pub mod router;
 
 pub use buffer::{DeviceKind, PlaceholderBuffer, ZoneBuffer};
-pub use config::{LoopSemantics, OrbitConfig};
+pub use config::OrbitConfig;
 pub use gz_cache::{
     GzCache, GzCacheConfig, MemoryStats, Zone, ZoneKey, ZoneState,
 };
