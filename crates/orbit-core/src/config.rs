@@ -1,24 +1,15 @@
 //! Model and runtime configuration for Orbit.
 //!
-//! Default semantics: **Parallel Residual LoopMoE**
+//! **Only supported semantics: Parallel Residual LoopMoE**
 //!
 //!   h₀ = Embed(x)
-//!   for k in 1..R:          # loops execute in parallel
+//!   for k in 1..R:          # all loops in parallel
 //!       r_k = λ_k * Loop_k(h₀)
 //!   final = h₀ + Σ r_k
+//!
+//! Sequential recurrence has been removed from the design.
 
 use serde::{Deserialize, Serialize};
-
-/// How loops relate to each other.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum LoopSemantics {
-    /// Classic sequential recurrence: h_k = f(h_{k-1}).
-    Sequential,
-    /// Parallel residual: every loop reads h₀, outputs are summed.
-    /// This is the default for Orbit (enables full loop parallelism).
-    #[default]
-    ParallelResidual,
-}
 
 /// Top-level configuration for an Orbit model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,8 +36,6 @@ pub struct OrbitConfig {
     pub per_loop_routers: bool,
     /// Capacity factor for expert load balancing.
     pub capacity_factor: f32,
-    /// Loop execution semantics.
-    pub loop_semantics: LoopSemantics,
 }
 
 impl Default for OrbitConfig {
@@ -63,7 +52,6 @@ impl Default for OrbitConfig {
             residual_scale_init: 1.0,
             per_loop_routers: true,
             capacity_factor: 1.5,
-            loop_semantics: LoopSemantics::ParallelResidual,
         }
     }
 }
@@ -84,10 +72,5 @@ impl OrbitConfig {
             return Err("hidden_size must be divisible by num_heads".into());
         }
         Ok(())
-    }
-
-    /// Convenience: are loops fully parallel?
-    pub fn is_parallel_residual(&self) -> bool {
-        matches!(self.loop_semantics, LoopSemantics::ParallelResidual)
     }
 }
