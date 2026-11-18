@@ -1,9 +1,14 @@
-//! Looped Mixture-of-Experts layer.
+//! Parallel Residual LoopMoE layer.
 //!
-//! Shared experts + optional per-loop routers + residual scaling (λ_k)
-//! + input re-injection (η).
+//! Semantics:
+//!   h0 = input
+//!   for k in 0..R:          # parallel
+//!       r_k = λ_k * ExpertPath_k(h0)
+//!   out = h0 + sum(r_k)
+//!
+//! Sequential recurrence is no longer the default.
 
-use crate::config::OrbitConfig;
+use crate::config::{LoopSemantics, OrbitConfig};
 use crate::iter_adln::IterAdaLN;
 use crate::router::{top_k, RoutingDecision};
 use crate::{OrbitError, Result};
@@ -14,7 +19,7 @@ pub struct Expert {
     pub id: usize,
 }
 
-/// The shared set of experts plus routing & modulation state.
+/// Shared experts + per-loop routers + residual scales.
 #[derive(Debug)]
 pub struct LoopedMoELayer {
     pub config: OrbitConfig,
@@ -51,6 +56,41 @@ impl LoopedMoELayer {
         })
     }
 
+    /// Parallel residual forward over **all** loops from the same base `h0`.
+    ///
+    /// Real implementation will:
+    /// 1. For each loop k in parallel:
+    ///    - IterAdaLN(h0, k)
+    ///    - Attention / MoE with Router_k
+    ///    - scale by λ_k
+    /// 2. Sum residuals into h0
+    pub fn forward_parallel_residual(&self, h0: &[f32]) -> Result<Vec<f32>> {
+        if !matches!(self.config.loop_semantics, LoopSemantics::ParallelResidual) {
+            return Err(OrbitError::Config(
+                "forward_parallel_residual requires ParallelResidual semantics".into(),
+            ));
+        }
+
+        let mut acc = h0.to_vec();
+
+        for k in 0..self.config.num_loops {
+            let _ada = self.iter_adln_moe.forward(k, h0)?;
+
+            // Placeholder routing + expert (identity path for now)
+            let dummy_logits = vec![0.0f32; self.config.num_experts];
+            let decision: RoutingDecision = top_k(&dummy_logits, self.config.top_k)?;
+            let _ = decision;
+
+            let lambda = self.lambda[k];
+            // Real: acc[i] += lambda * expert_out[i]
+            // Scaffold: no-op residual (keeps numerical shape)
+            let _ = lambda;
+        }
+
+        Ok(acc)
+    }
+
+    /// Legacy single-loop path (only valid under Sequential semantics).
     pub fn forward_loop(
         &self,
         loop_idx: usize,
@@ -64,25 +104,10 @@ impl LoopedMoELayer {
             )));
         }
 
-        let _ada_attn = self.iter_adln_attn.forward(loop_idx, hidden)?;
-        let m = hidden.to_vec();
-        let _ada_moe = self.iter_adln_moe.forward(loop_idx, &m)?;
-
+        let _ada = self.iter_adln_moe.forward(loop_idx, hidden)?;
         let dummy_logits = vec![0.0f32; self.config.num_experts];
-        let decision: RoutingDecision = top_k(&dummy_logits, self.config.top_k)?;
+        let _decision = top_k(&dummy_logits, self.config.top_k)?;
 
-        let mut moe_out = vec![0.0f32; m.len()];
-        for (eid, w) in decision.expert_ids.iter().zip(decision.weights.iter()) {
-            let _ = (eid, w);
-        }
-
-        let lambda = self.lambda[loop_idx];
-        let out: Vec<f32> = m
-            .iter()
-            .zip(moe_out.iter())
-            .map(|(m_i, e_i)| m_i + lambda * e_i)
-            .collect();
-
-        Ok(out)
+        Ok(hidden.to_vec())
     }
 }
