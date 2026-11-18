@@ -1,17 +1,21 @@
-//! Orbit Core — Looped Mixture-of-Experts primitives + Grouped-Zonal Cache
+//! Orbit Core — Parallel Residual LoopMoE primitives + Grouped-Zonal Cache
 //!
-//! This crate provides the mathematical and memory building blocks for
-//! the Orbit inference engine:
+//! Model semantics (default):
+//!   h0 = Embed(x)
+//!   for k in 1..R (parallel):
+//!       r_k = λ_k * Loop_k(h0)
+//!   final = h0 + sum(r_k)
 //!
-//! - [`config`]        — model & runtime configuration
-//! - [`buffer`]        — abstract ZoneBuffer trait + placeholder
-//! - [`gz_cache`]      — Grouped-Zonal Cache (route / zone / reuse / zip)
-//! - [`looped_moe`]    — shared experts + per-loop routers + residual scaling
-//! - [`iter_adln`]     — IterAdaLN (iteration-aware adaptive LayerNorm)
-//! - [`router`]        — Top-K routing utilities
+//! Modules:
+//! - [`config`]     — OrbitConfig + LoopSemantics
+//! - [`buffer`]     — ZoneBuffer trait
+//! - [`gz_cache`]   — Grouped-Zonal Cache
+//! - [`looped_moe`] — parallel residual layer skeleton
+//! - [`iter_adln`]  — iteration-aware adaptive LN
+//! - [`router`]     — Top-K routing
 
 #![deny(missing_docs)]
-#![allow(dead_code)] // scaffolding while we build out real implementations
+#![allow(dead_code)]
 
 pub mod buffer;
 pub mod config;
@@ -21,7 +25,7 @@ pub mod looped_moe;
 pub mod router;
 
 pub use buffer::{DeviceKind, PlaceholderBuffer, ZoneBuffer};
-pub use config::OrbitConfig;
+pub use config::{LoopSemantics, OrbitConfig};
 pub use gz_cache::{
     GzCache, GzCacheConfig, MemoryStats, Zone, ZoneKey, ZoneState,
 };
